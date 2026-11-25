@@ -49,6 +49,12 @@ jobs:
           cd $(go env GOROOT)
           for p in $GITHUB_WORKSPACE/.github/patch/*.patch; do patch --verbose -p 1 < "$p"; done
 
+      - name: Verify Mihomo Fallback Patch
+        working-directory: core/src/foss/golang/clash
+        run: |
+          go vet ./adapter/outboundgroup/...
+          go test -race -v ./adapter/outboundgroup -run TestFallback
+
       - uses: actions/cache@v5
         with:
           path: |
@@ -106,14 +112,16 @@ jobs:
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          if [ -n "$SIGNING_KEYSTORE_BASE64" ]; then
-            echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > release.keystore
-            {
-              echo "keystore.password=$SIGNING_STORE_PASSWORD"
-              echo "key.alias=$SIGNING_KEY_ALIAS"
-              echo "key.password=$SIGNING_KEY_PASSWORD"
-            } > signing.properties
+          if [ -z "$SIGNING_KEYSTORE_BASE64" ]; then
+            echo "::error::SIGNING_KEYSTORE_BASE64 secret is required for release builds"
+            exit 1
           fi
+          echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > release.keystore
+          {
+            echo "keystore.password=$SIGNING_STORE_PASSWORD"
+            echo "key.alias=$SIGNING_KEY_ALIAS"
+            echo "key.password=$SIGNING_KEY_PASSWORD"
+          } > signing.properties
 
       - name: Release Build
         if: success()

@@ -1,8 +1,8 @@
 diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.go
-index 98aaf20..a8a576c 100644
+index 98aaf20..e6d1b65 100644
 --- a/adapter/outboundgroup/fallback.go
 +++ b/adapter/outboundgroup/fallback.go
-@@ -4,15 +4,198 @@ import (
+@@ -4,15 +4,201 @@ import (
  	"context"
  	"encoding/json"
  	"errors"
@@ -23,15 +23,18 @@ index 98aaf20..a8a576c 100644
  )
  
 +const (
-+	fallbackStaggerDelay       = 1500 * time.Millisecond
++	fallbackMinStaggerDelay    = 1500 * time.Millisecond
++	fallbackMaxStaggerDelay    = 3000 * time.Millisecond
 +	fallbackMaxDialAttempts    = 3
-+	fallbackStallThreshold     = 4 * time.Second
++	fallbackMinStallThreshold  = 4 * time.Second
++	fallbackMaxStallThreshold  = 10 * time.Second
 +	fallbackProbeTimeout       = 3 * time.Second
 +	fallbackHostWindow         = 60 * time.Second
 +	fallbackHostThreshold      = 3
 +	fallbackBaseCooldown       = 30 * time.Second
 +	fallbackMaxCooldown        = 5 * time.Minute
 +	fallbackRecoveryStableTime = 5 * time.Minute
++	fallbackCloseSampleDelay   = 2 * time.Second
 +)
 +
 +type proxyFailState struct {
@@ -57,7 +60,7 @@ index 98aaf20..a8a576c 100644
 +	}
 +	timeout := c.stallTimeout
 +	if timeout <= 0 {
-+		timeout = fallbackStallThreshold
++		timeout = fallbackMinStallThreshold
 +	}
 +	t := time.AfterFunc(timeout, func() {
 +		if !c.closed.Load() && c.done.CompareAndSwap(false, true) && c.onSuspect != nil {
@@ -201,18 +204,19 @@ index 98aaf20..a8a576c 100644
  type FallbackOption struct{}
  
  type Fallback struct {
-@@ -21,6 +204,264 @@ type Fallback struct {
+@@ -21,6 +207,369 @@ type Fallback struct {
  	testUrl        string
  	selected       string
  	expectedStatus string
 +
-+	stateMux       sync.Mutex
-+	proxyStates    map[string]*proxyFailState
-+	stallTimeout   time.Duration
-+	staggerDelay   time.Duration
-+	probeTimeout   time.Duration
-+	baseCooldown   time.Duration
-+	recoveryWindow time.Duration
++	stateMux         sync.Mutex
++	proxyStates      map[string]*proxyFailState
++	stallTimeout     time.Duration
++	staggerDelay     time.Duration
++	probeTimeout     time.Duration
++	baseCooldown     time.Duration
++	recoveryWindow   time.Duration
++	closeSampleDelay time.Duration
 +}
 +
 +func isSkippableAdapter(adapterType C.AdapterType) bool {
@@ -223,18 +227,42 @@ index 98aaf20..a8a576c 100644
 +		adapterType == C.RejectDrop
 +}
 +
-+func (f *Fallback) effectiveStallTimeout() time.Duration {
++func (f *Fallback) stallTimeoutForProxy(proxy C.Proxy) time.Duration {
 +	if f.stallTimeout > 0 {
 +		return f.stallTimeout
 +	}
-+	return fallbackStallThreshold
++	if proxy != nil {
++		if delay := proxy.LastDelayForTestUrl(f.testUrl); delay > 0 {
++			d := 3*time.Duration(delay)*time.Millisecond + 2*time.Second
++			if d < fallbackMinStallThreshold {
++				return fallbackMinStallThreshold
++			}
++			if d > fallbackMaxStallThreshold {
++				return fallbackMaxStallThreshold
++			}
++			return d
++		}
++	}
++	return fallbackMinStallThreshold
 +}
 +
-+func (f *Fallback) effectiveStaggerDelay() time.Duration {
++func (f *Fallback) staggerDelayForProxy(proxy C.Proxy) time.Duration {
 +	if f.staggerDelay > 0 {
 +		return f.staggerDelay
 +	}
-+	return fallbackStaggerDelay
++	if proxy != nil {
++		if delay := proxy.LastDelayForTestUrl(f.testUrl); delay > 0 {
++			d := 2 * time.Duration(delay) * time.Millisecond
++			if d < fallbackMinStaggerDelay {
++				return fallbackMinStaggerDelay
++			}
++			if d > fallbackMaxStaggerDelay {
++				return fallbackMaxStaggerDelay
++			}
++			return d
++		}
++	}
++	return fallbackMinStaggerDelay
 +}
 +
 +func (f *Fallback) effectiveProbeTimeout() time.Duration {
@@ -256,6 +284,13 @@ index 98aaf20..a8a576c 100644
 +		return f.recoveryWindow
 +	}
 +	return fallbackRecoveryStableTime
++}
++
++func (f *Fallback) effectiveCloseSampleDelay() time.Duration {
++	if f.closeSampleDelay > 0 {
++		return f.closeSampleDelay
++	}
++	return fallbackCloseSampleDelay
 +}
 +
 +func (f *Fallback) isDemotedLocked(name string, now time.Time) bool {
@@ -305,12 +340,12 @@ index 98aaf20..a8a576c 100644
 +	f.stateMux.Unlock()
 +
 +	log.Warnln("Fallback[%s]: proxy %s demoted for %v (%s)", f.Name(), name, cooldown, reason)
-+	go f.closeConnectionsForProxy(name)
++	go f.closeStalledConnectionsForProxy(name)
 +}
 +
-+func (f *Fallback) closeConnectionsForProxy(proxyName string) {
++func (f *Fallback) closeStalledConnectionsForProxy(proxyName string) {
 +	groupName := f.Name()
-+	var toClose []statistic.Tracker
++	snap := make(map[statistic.Tracker]int64)
 +	statistic.DefaultManager.Range(func(c statistic.Tracker) bool {
 +		info := c.Info()
 +		if info == nil {
@@ -326,17 +361,79 @@ index 98aaf20..a8a576c 100644
 +			}
 +		}
 +		if hasGroup && hasProxy {
-+			toClose = append(toClose, c)
++			snap[c] = info.DownloadTotal.Load()
 +		}
 +		return true
 +	})
 +
-+	for _, c := range toClose {
-+		_ = c.Close()
++	if len(snap) == 0 {
++		return
 +	}
-+	if len(toClose) > 0 {
-+		log.Warnln("Fallback[%s]: closed %d active connections on demoted proxy %s", groupName, len(toClose), proxyName)
++
++	time.Sleep(f.effectiveCloseSampleDelay())
++
++	closedCount := 0
++	for c, prevDownload := range snap {
++		info := c.Info()
++		if info == nil {
++			continue
++		}
++		// Only close connections whose downloaded bytes did not advance during the sample window.
++		if info.DownloadTotal.Load() == prevDownload {
++			_ = c.Close()
++			closedCount++
++		}
 +	}
++	if closedCount > 0 {
++		log.Warnln("Fallback[%s]: closed %d stalled connections on demoted proxy %s", groupName, closedCount, proxyName)
++	}
++}
++
++func (f *Fallback) findProbePeer(excludeName string) C.Proxy {
++	proxies := f.GetProxies(false)
++	now := time.Now()
++
++	f.stateMux.Lock()
++	defer f.stateMux.Unlock()
++
++	var fallbackPeer C.Proxy
++	for _, p := range proxies {
++		if p.Name() == excludeName || isSkippableAdapter(p.Type()) {
++			continue
++		}
++		if !f.isDemotedLocked(p.Name(), now) {
++			if p.AliveForTestUrl(f.testUrl) {
++				return p
++			}
++			if fallbackPeer == nil {
++				fallbackPeer = p
++			}
++		} else if fallbackPeer == nil {
++			fallbackPeer = p
++		}
++	}
++	return fallbackPeer
++}
++
++func (f *Fallback) probePair(ctx context.Context, self, peer C.Proxy) (errSelf, errPeer error) {
++	expectedStatus, _ := utils.NewUnsignedRanges[uint16](f.expectedStatus)
++	if peer == nil {
++		_, errSelf = self.URLTest(ctx, f.testUrl, expectedStatus)
++		return errSelf, errors.New("no peer proxy available")
++	}
++
++	var wg sync.WaitGroup
++	wg.Add(2)
++	go func() {
++		defer wg.Done()
++		_, errSelf = self.URLTest(ctx, f.testUrl, expectedStatus)
++	}()
++	go func() {
++		defer wg.Done()
++		_, errPeer = peer.URLTest(ctx, f.testUrl, expectedStatus)
++	}()
++	wg.Wait()
++	return errSelf, errPeer
 +}
 +
 +func (f *Fallback) reportSuspect(proxy C.Proxy, host string, strong bool) {
@@ -368,19 +465,25 @@ index 98aaf20..a8a576c 100644
 +		return
 +	}
 +
-+	if st.suspectHosts == nil {
-+		st.suspectHosts = make(map[string]time.Time)
-+	}
-+	for h, ts := range st.suspectHosts {
-+		if now.Sub(ts) > fallbackHostWindow {
-+			delete(st.suspectHosts, h)
++	// Only strong signals (watchdog stall / reset / timeout) count toward multi-host demotion.
++	// Weak signals (e.g. io.EOF from a dead target site) only trigger at most a comparative probe.
++	if strong {
++		if st.suspectHosts == nil {
++			st.suspectHosts = make(map[string]time.Time)
++		}
++		for h, ts := range st.suspectHosts {
++			if now.Sub(ts) > fallbackHostWindow {
++				delete(st.suspectHosts, h)
++			}
++		}
++		st.suspectHosts[host] = now
++
++		if len(st.suspectHosts) >= fallbackHostThreshold {
++			shouldDemoteMultiHost = true
 +		}
 +	}
-+	st.suspectHosts[host] = now
 +
-+	if len(st.suspectHosts) >= fallbackHostThreshold {
-+		shouldDemoteMultiHost = true
-+	} else if (strong || len(st.suspectHosts) >= 2) && !st.probing {
++	if !shouldDemoteMultiHost && !st.probing {
 +		st.probing = true
 +		shouldProbe = true
 +	}
@@ -392,6 +495,7 @@ index 98aaf20..a8a576c 100644
 +	}
 +
 +	if shouldProbe {
++		peer := f.findProbePeer(name)
 +		go func() {
 +			defer func() {
 +				f.stateMux.Lock()
@@ -403,9 +507,11 @@ index 98aaf20..a8a576c 100644
 +
 +			ctx, cancel := context.WithTimeout(context.Background(), f.effectiveProbeTimeout())
 +			defer cancel()
-+			expectedStatus, _ := utils.NewUnsignedRanges[uint16](f.expectedStatus)
-+			if _, err := proxy.URLTest(ctx, f.testUrl, expectedStatus); err != nil {
-+				f.demoteProxy(proxy, "targeted URLTest failed: "+err.Error())
++
++			errSelf, errPeer := f.probePair(ctx, proxy, peer)
++			// Only demote when self fails AND peer succeeds; if both fail, treat as local outage.
++			if errSelf != nil && errPeer == nil {
++				f.demoteProxy(proxy, "comparative URLTest failed while peer ok: "+errSelf.Error())
 +			}
 +		}()
 +	}
@@ -443,7 +549,9 @@ index 98aaf20..a8a576c 100644
 +		p := proxy
 +		c = callback.NewFirstWriteCallBackConn(c, func(wErr error) {
 +			if wErr == nil {
-+				f.recordProxySuccess(p)
++				// First write succeeding only means bytes entered the transport;
++				// do NOT clear suspectHosts until a real response byte is received.
++				f.onDialSuccess()
 +			} else if !isIgnoredFallbackError(wErr) {
 +				f.reportSuspect(p, host, true)
 +			}
@@ -453,7 +561,7 @@ index 98aaf20..a8a576c 100644
 +		p := proxy
 +		c = &fallbackObserverConn{
 +			Conn:         c,
-+			stallTimeout: f.effectiveStallTimeout(),
++			stallTimeout: f.stallTimeoutForProxy(p),
 +			onSuccess: func() {
 +				f.recordProxySuccess(p)
 +			},
@@ -466,7 +574,7 @@ index 98aaf20..a8a576c 100644
  }
  
  func (f *Fallback) Now() string {
-@@ -28,38 +469,170 @@ func (f *Fallback) Now() string {
+@@ -28,38 +577,176 @@ func (f *Fallback) Now() string {
  	return proxy.Name()
  }
  
@@ -531,7 +639,7 @@ index 98aaf20..a8a576c 100644
 +
 +	launchNext()
 +
-+	stagger := time.NewTimer(f.effectiveStaggerDelay())
++	stagger := time.NewTimer(f.staggerDelayForProxy(candidates[0]))
 +	defer stagger.Stop()
 +
 +	var failedProxies []C.Proxy
@@ -573,6 +681,7 @@ index 98aaf20..a8a576c 100644
 +				failedProxies = append(failedProxies, res.proxy)
 +			}
 +			if launched < maxAttempts {
++				nextProxy := candidates[launched]
 +				launchNext()
 +				if launched < maxAttempts {
 +					if !stagger.Stop() {
@@ -581,14 +690,15 @@ index 98aaf20..a8a576c 100644
 +						default:
 +						}
 +					}
-+					stagger.Reset(f.effectiveStaggerDelay())
++					stagger.Reset(f.staggerDelayForProxy(nextProxy))
 +				}
 +			}
 +
 +		case <-timerCh:
++			nextProxy := candidates[launched]
 +			launchNext()
 +			if launched < maxAttempts {
-+				stagger.Reset(f.effectiveStaggerDelay())
++				stagger.Reset(f.staggerDelayForProxy(nextProxy))
 +			}
 +
 +		case <-ctx.Done():
@@ -613,7 +723,11 @@ index 98aaf20..a8a576c 100644
  
 -	return c, err
 +	cancelAll()
-+	// All candidates failed: likely a local network issue; do not demote or escalate cooldown.
++	// All candidates failed: likely a local network issue; do not demote or escalate cooldown,
++	// but still notify GroupBase so health check can refresh when connectivity returns.
++	if ctx.Err() == nil && lastErr != nil && !isIgnoredFallbackError(lastErr) {
++		f.onDialFailed(candidates[0].Type(), lastErr, f.healthCheck)
++	}
 +	return nil, lastErr
  }
  
@@ -627,8 +741,9 @@ index 98aaf20..a8a576c 100644
 +	maxAttempts := len(candidates)
 +	if maxAttempts > fallbackMaxDialAttempts {
 +		maxAttempts = fallbackMaxDialAttempts
-+	}
-+
+ 	}
+ 
+-	return pc, err
 +	host := metadataHostKey(metadata)
 +	var failedProxies []C.Proxy
 +	var lastErr error
@@ -649,14 +764,13 @@ index 98aaf20..a8a576c 100644
 +			return nil, err
 +		}
 +		failedProxies = append(failedProxies, proxy)
- 	}
- 
--	return pc, err
++	}
++
 +	return nil, lastErr
  }
  
  // SupportUDP implements C.ProxyAdapter
-@@ -83,13 +656,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+@@ -83,13 +770,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
  	for _, proxy := range f.GetProxies(false) {
  		all = append(all, proxy.Name())
  	}
@@ -674,7 +788,7 @@ index 98aaf20..a8a576c 100644
  		"hidden":         f.Hidden(),
  		"icon":           f.Icon(),
  		"emptyFallback":  f.EmptyFallback().Name(),
-@@ -102,25 +678,80 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
+@@ -102,25 +792,80 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
  	return proxy
  }
  
@@ -688,8 +802,8 @@ index 98aaf20..a8a576c 100644
 +	now := time.Now()
 +
 +	f.stateMux.Lock()
-+	// Prune states for proxies that were removed from providers.
-+	if len(f.proxyStates) > len(proxies) {
++	// Always prune states for proxies that were removed or replaced in providers.
++	if len(f.proxyStates) > 0 {
 +		active := make(map[string]struct{}, len(proxies))
 +		for _, p := range proxies {
 +			active[p.Name()] = struct{}{}
@@ -749,7 +863,8 @@ index 98aaf20..a8a576c 100644
  		}
  	}
 +	f.stateMux.Unlock()
-+
+ 
+-	return proxies[0]
 +	candidates := make([]C.Proxy, 0, len(proxies))
 +	candidates = append(candidates, aliveHealthy...)
 +	candidates = append(candidates, aliveDemoted...)
@@ -757,15 +872,14 @@ index 98aaf20..a8a576c 100644
 +	candidates = append(candidates, otherDemoted...)
 +	return candidates
 +}
- 
--	return proxies[0]
++
 +func (f *Fallback) findAliveProxy(touch bool) C.Proxy {
 +	candidates := f.getCandidates(touch)
 +	return candidates[0]
  }
  
  func (f *Fallback) Set(name string) error {
-@@ -136,7 +767,11 @@ func (f *Fallback) Set(name string) error {
+@@ -136,7 +881,11 @@ func (f *Fallback) Set(name string) error {
  		return errors.New("proxy not exist")
  	}
  
@@ -777,7 +891,7 @@ index 98aaf20..a8a576c 100644
  	if !p.AliveForTestUrl(f.testUrl) {
  		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
  		defer cancel()
-@@ -148,7 +783,10 @@ func (f *Fallback) Set(name string) error {
+@@ -148,7 +897,10 @@ func (f *Fallback) Set(name string) error {
  }
  
  func (f *Fallback) ForceSet(name string) {
@@ -788,10 +902,348 @@ index 98aaf20..a8a576c 100644
  }
  
  func (f *Fallback) Providers() []P.ProxyProvider {
-@@ -177,5 +815,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
+@@ -177,5 +929,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
  		disableUDP:     option.DisableUDP,
  		testUrl:        option.URL,
  		expectedStatus: option.ExpectedStatus,
 +		proxyStates:    make(map[string]*proxyFailState),
  	}, nil
  }
+diff --git a/adapter/outboundgroup/fallback_test.go b/adapter/outboundgroup/fallback_test.go
+new file mode 100644
+index 0000000..af206e2
+--- /dev/null
++++ b/adapter/outboundgroup/fallback_test.go
+@@ -0,0 +1,332 @@
++package outboundgroup
++
++import (
++	"context"
++	"errors"
++	"io"
++	"net"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/adapter/outbound"
++	N "github.com/metacubex/mihomo/common/net"
++	"github.com/metacubex/mihomo/common/utils"
++	C "github.com/metacubex/mihomo/constant"
++	P "github.com/metacubex/mihomo/constant/provider"
++	"github.com/metacubex/mihomo/tunnel/statistic"
++)
++
++type mockConn struct {
++	N.ExtendedConn
++	chains        C.Chain
++	readFn        func([]byte) (int, error)
++	writeFn       func([]byte) (int, error)
++	needHandshake bool
++	closed        atomic.Bool
++}
++
++func (m *mockConn) Chains() C.Chain                  { return m.chains }
++func (m *mockConn) AppendToChains(a C.ProxyAdapter)  { m.chains = append(m.chains, a.Name()) }
++func (m *mockConn) ProviderChains() C.Chain          { return nil }
++func (m *mockConn) RemoteDestination() string        { return "" }
++func (m *mockConn) NeedHandshake() bool              { return m.needHandshake }
++func (m *mockConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
++func (m *mockConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
++func (m *mockConn) SetDeadline(time.Time) error      { return nil }
++func (m *mockConn) SetReadDeadline(time.Time) error  { return nil }
++func (m *mockConn) SetWriteDeadline(time.Time) error { return nil }
++func (m *mockConn) Close() error                     { m.closed.Store(true); return nil }
++func (m *mockConn) Read(b []byte) (int, error) {
++	if m.readFn != nil {
++		return m.readFn(b)
++	}
++	return 0, io.EOF
++}
++func (m *mockConn) Write(b []byte) (int, error) {
++	if m.writeFn != nil {
++		return m.writeFn(b)
++	}
++	return len(b), nil
++}
++
++type mockProxy struct {
++	*outbound.Base
++	alive      atomic.Bool
++	lastDelay  atomic.Uint32
++	dialFn     func(context.Context, *C.Metadata) (C.Conn, error)
++	urlTestErr atomic.Pointer[error]
++	urlTests   atomic.Int32
++}
++
++func newMockProxy(name string) *mockProxy {
++	p := &mockProxy{
++		Base: outbound.NewBase(outbound.BaseOption{
++			Name: name,
++			Type: C.Vless,
++		}),
++	}
++	p.alive.Store(true)
++	p.lastDelay.Store(100)
++	return p
++}
++
++func (p *mockProxy) Adapter() C.ProxyAdapter                      { return p }
++func (p *mockProxy) AliveForTestUrl(string) bool                  { return p.alive.Load() }
++func (p *mockProxy) DelayHistory() []C.DelayHistory               { return nil }
++func (p *mockProxy) ExtraDelayHistories() map[string]C.ProxyState { return nil }
++func (p *mockProxy) LastDelayForTestUrl(string) uint16            { return uint16(p.lastDelay.Load()) }
++func (p *mockProxy) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (uint16, error) {
++	p.urlTests.Add(1)
++	if ep := p.urlTestErr.Load(); ep != nil && *ep != nil {
++		return 0, *ep
++	}
++	return 50, nil
++}
++func (p *mockProxy) DialContext(ctx context.Context, metadata *C.Metadata) (C.Conn, error) {
++	if p.dialFn != nil {
++		return p.dialFn(ctx, metadata)
++	}
++	return &mockConn{}, nil
++}
++func (p *mockProxy) ListenPacketContext(context.Context, *C.Metadata) (C.PacketConn, error) {
++	return nil, C.ErrNotSupport
++}
++
++type mockProvider struct {
++	P.ProxyProvider
++	proxies []C.Proxy
++}
++
++func (m *mockProvider) Name() string               { return "mock" }
++func (m *mockProvider) VehicleType() P.VehicleType { return P.Compatible }
++func (m *mockProvider) Type() P.ProviderType       { return P.Proxy }
++func (m *mockProvider) Proxies() []C.Proxy         { return m.proxies }
++func (m *mockProvider) Touch()                     {}
++func (m *mockProvider) HealthCheck()               {}
++func (m *mockProvider) Version() uint32            { return 1 }
++
++func newTestFallback(t *testing.T, proxies ...C.Proxy) *Fallback {
++	t.Helper()
++	fb, err := NewFallback(GroupCommonOption{
++		Name: "CF-Fallback",
++		URL:  "https://www.gstatic.com/generate_204",
++	}, FallbackOption{}, proxies[0], []P.ProxyProvider{&mockProvider{proxies: proxies}})
++	if err != nil {
++		t.Fatalf("NewFallback failed: %v", err)
++	}
++	fb.stallTimeout = 80 * time.Millisecond
++	fb.staggerDelay = 60 * time.Millisecond
++	fb.probeTimeout = 200 * time.Millisecond
++	fb.baseCooldown = 200 * time.Millisecond
++	fb.recoveryWindow = 200 * time.Millisecond
++	fb.closeSampleDelay = 60 * time.Millisecond
++	return fb
++}
++
++func TestFallbackPairedProbeDemotesOnlyWhenPeerHealthy(t *testing.T) {
++	// Case 1: primary fails probe, backup passes -> demote primary
++	primary := newMockProxy("cf-primary")
++	backup := newMockProxy("backup-1")
++	probeErr := errors.New("probe timeout")
++	primary.urlTestErr.Store(&probeErr)
++
++	fb := newTestFallback(t, primary, backup)
++	c, err := fb.DialContext(context.Background(), &C.Metadata{Host: "example.com"})
++	if err != nil {
++		t.Fatalf("DialContext failed: %v", err)
++	}
++	defer c.Close()
++
++	if _, err := c.Write([]byte("GET / HTTP/1.1\r\n\r\n")); err != nil {
++		t.Fatalf("Write failed: %v", err)
++	}
++
++	deadline := time.Now().Add(500 * time.Millisecond)
++	for time.Now().Before(deadline) {
++		if fb.Now() == "backup-1" {
++			break
++		}
++		time.Sleep(15 * time.Millisecond)
++	}
++	if got := fb.Now(); got != "backup-1" {
++		t.Fatalf("expected fallback to backup-1 when peer ok, got %s", got)
++	}
++
++	// Case 2: BOTH primary and backup fail probe (local outage) -> do NOT demote
++	p2 := newMockProxy("cf-primary-2")
++	b2 := newMockProxy("backup-2")
++	p2.urlTestErr.Store(&probeErr)
++	b2.urlTestErr.Store(&probeErr)
++	fb2 := newTestFallback(t, p2, b2)
++
++	fb2.reportSuspect(p2, "example.com", true)
++	time.Sleep(100 * time.Millisecond)
++	if got := fb2.Now(); got != "cf-primary-2" {
++		t.Fatalf("both probes failing (local outage) must NOT demote primary, got %s", got)
++	}
++}
++
++func TestFallbackFirstWriteDoesNotClearSuspectHosts(t *testing.T) {
++	primary := newMockProxy("cf-primary")
++	backup := newMockProxy("backup-1")
++	primary.dialFn = func(context.Context, *C.Metadata) (C.Conn, error) {
++		return &mockConn{needHandshake: true}, nil
++	}
++
++	fb := newTestFallback(t, primary, backup)
++
++	// Open 3 NeedHandshake connections to 3 distinct hosts; Write succeeds on all 3, Read never returns.
++	for _, host := range []string{"a.com", "b.com", "c.com"} {
++		c, err := fb.DialContext(context.Background(), &C.Metadata{Host: host})
++		if err != nil {
++			t.Fatalf("DialContext(%s) failed: %v", host, err)
++		}
++		defer c.Close()
++		if _, err := c.Write([]byte("hello")); err != nil {
++			t.Fatalf("Write(%s) failed: %v", host, err)
++		}
++	}
++
++	deadline := time.Now().Add(500 * time.Millisecond)
++	for time.Now().Before(deadline) {
++		if fb.Now() == "backup-1" {
++			break
++		}
++		time.Sleep(15 * time.Millisecond)
++	}
++	if got := fb.Now(); got != "backup-1" {
++		t.Fatalf("3 stalled NeedHandshake hosts should demote primary even though first write succeeded, got %s", got)
++	}
++}
++
++func TestFallbackWeakEOFNotCountedInMultiHostDemotion(t *testing.T) {
++	primary := newMockProxy("cf-primary")
++	backup := newMockProxy("backup-1")
++	fb := newTestFallback(t, primary, backup)
++
++	// 3 distinct dead target sites returning weak EOF while primary probe passes -> MUST NOT demote
++	for _, host := range []string{"dead1.com", "dead2.com", "dead3.com"} {
++		fb.reportSuspect(primary, host, false)
++	}
++	time.Sleep(80 * time.Millisecond)
++	if got := fb.Now(); got != "cf-primary" {
++		t.Fatalf("weak EOF across 3 hosts must NOT demote healthy primary, got %s", got)
++	}
++}
++
++func TestFallbackCooldownIgnoresLateSuccess(t *testing.T) {
++	primary := newMockProxy("cf-primary")
++	backup := newMockProxy("backup-1")
++	fb := newTestFallback(t, primary, backup)
++
++	fb.demoteProxy(primary, "test")
++	fb.recordProxySuccess(primary)
++	if got := fb.Now(); got != "backup-1" {
++		t.Fatalf("late success during cooldown must not resurrect primary, got %s", got)
++	}
++}
++
++func TestFallbackStaggeredConcurrentDialAndLocalOutage(t *testing.T) {
++	primary := newMockProxy("cf-primary")
++	backup := newMockProxy("backup-1")
++	primary.dialFn = func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
++		<-ctx.Done()
++		return nil, ctx.Err()
++	}
++	backup.dialFn = func(ctx context.Context, _ *C.Metadata) (C.Conn, error) {
++		return &mockConn{}, nil
++	}
++
++	fb := newTestFallback(t, primary, backup)
++	c, err := fb.DialContext(context.Background(), &C.Metadata{Host: "google.com"})
++	if err != nil {
++		t.Fatalf("expected staggered dial to succeed on backup, got err: %v", err)
++	}
++	c.Close()
++
++	// Local outage: all proxies fail -> neither demoted
++	p1 := newMockProxy("p1")
++	p2 := newMockProxy("p2")
++	p1.dialFn = func(context.Context, *C.Metadata) (C.Conn, error) { return nil, errors.New("network unreachable") }
++	p2.dialFn = func(context.Context, *C.Metadata) (C.Conn, error) { return nil, errors.New("network unreachable") }
++	fb2 := newTestFallback(t, p1, p2)
++	if _, err := fb2.DialContext(context.Background(), &C.Metadata{Host: "google.com"}); err == nil {
++		t.Fatalf("expected error when all proxies fail")
++	}
++	if fb2.Now() != "p1" {
++		t.Fatalf("local outage should not demote p1, got %s", fb2.Now())
++	}
++}
++
++func TestFallbackDemoteClosesOnlyStalledConnections(t *testing.T) {
++	primary := newMockProxy("cf-primary")
++	backup := newMockProxy("backup-1")
++	fb := newTestFallback(t, primary, backup)
++
++	rawStalled := &mockConn{chains: C.Chain{"cf-primary", "CF-Fallback"}}
++	rawActive := &mockConn{chains: C.Chain{"cf-primary", "CF-Fallback"}}
++	rawBackup := &mockConn{chains: C.Chain{"backup-1", "CF-Fallback"}}
++
++	trStalled := statistic.NewTCPTracker(rawStalled, statistic.DefaultManager, &C.Metadata{Host: "stalled.com"}, nil, 0, 0, true)
++	trActive := statistic.NewTCPTracker(rawActive, statistic.DefaultManager, &C.Metadata{Host: "downloading.com"}, nil, 0, 0, true)
++	trBackup := statistic.NewTCPTracker(rawBackup, statistic.DefaultManager, &C.Metadata{Host: "other.com"}, nil, 0, 0, true)
++	defer trStalled.Close()
++	defer trActive.Close()
++	defer trBackup.Close()
++
++	fb.demoteProxy(primary, "test smart close")
++
++	// Simulate active connection continuing to download bytes during the 60ms sample window
++	time.Sleep(20 * time.Millisecond)
++	trActive.Info().DownloadTotal.Add(4096)
++
++	deadline := time.Now().Add(500 * time.Millisecond)
++	for time.Now().Before(deadline) {
++		if rawStalled.closed.Load() {
++			break
++		}
++		time.Sleep(10 * time.Millisecond)
++	}
++
++	if !rawStalled.closed.Load() {
++		t.Fatalf("expected stalled connection (0 download delta) to be closed")
++	}
++	if rawActive.closed.Load() {
++		t.Fatalf("active downloading connection on primary should NOT be closed")
++	}
++	if rawBackup.closed.Load() {
++		t.Fatalf("connection on backup should NOT be closed")
++	}
++}
++
++func TestFallbackDynamicDelayThresholds(t *testing.T) {
++	pLow := newMockProxy("low")
++	pLow.lastDelay.Store(100)
++	pMid := newMockProxy("mid")
++	pMid.lastDelay.Store(1000)
++	pHigh := newMockProxy("high")
++	pHigh.lastDelay.Store(4000)
++
++	fb, _ := NewFallback(GroupCommonOption{Name: "dyn"}, FallbackOption{}, pLow, []P.ProxyProvider{&mockProvider{proxies: []C.Proxy{pLow, pMid, pHigh}}})
++
++	if got := fb.staggerDelayForProxy(pLow); got != 1500*time.Millisecond {
++		t.Fatalf("low delay stagger expected 1.5s, got %v", got)
++	}
++	if got := fb.staggerDelayForProxy(pMid); got != 2000*time.Millisecond {
++		t.Fatalf("mid delay stagger expected 2s, got %v", got)
++	}
++	if got := fb.staggerDelayForProxy(pHigh); got != 3000*time.Millisecond {
++		t.Fatalf("high delay stagger expected 3s cap, got %v", got)
++	}
++
++	if got := fb.stallTimeoutForProxy(pLow); got != 4*time.Second {
++		t.Fatalf("low delay stall expected 4s, got %v", got)
++	}
++	if got := fb.stallTimeoutForProxy(pMid); got != 5*time.Second {
++		t.Fatalf("mid delay stall expected 5s, got %v", got)
++	}
++	if got := fb.stallTimeoutForProxy(pHigh); got != 10*time.Second {
++		t.Fatalf("high delay stall expected 10s cap, got %v", got)
++	}
++}
