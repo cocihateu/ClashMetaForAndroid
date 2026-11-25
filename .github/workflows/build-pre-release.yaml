@@ -58,7 +58,7 @@ jobs:
         working-directory: core/src/foss/golang/clash
         run: |
           go vet ./adapter/outboundgroup/...
-          go test -v ./adapter/outboundgroup -run TestFallback
+          CGO_ENABLED=1 go test -race -v ./adapter/outboundgroup -run TestFallback
 
       - name: Update CA
         run: |
