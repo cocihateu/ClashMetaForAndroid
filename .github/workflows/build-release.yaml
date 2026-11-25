@@ -20,7 +20,12 @@ jobs:
         run: git submodule update --init --recursive --force
 
       - name: Apply Mihomo Fallback Enhancement
-        run: cp -f $GITHUB_WORKSPACE/.github/mihomo-patch/fallback.go core/src/foss/golang/clash/adapter/outboundgroup/fallback.go
+        run: |
+          git -C core/src/foss/golang/clash apply --check "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/src/foss/golang/clash apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+
+      - name: Configure Custom Application ID
+        run: echo "custom.application.id=com.cocihateu.clash" >> local.properties
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -94,17 +99,19 @@ jobs:
 
       - name: Signing properties
         env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          touch signing.properties
-          echo keystore.password="$SIGNING_STORE_PASSWORD" > signing.properties
-          echo key.alias="$SIGNING_KEY_ALIAS" >> signing.properties
-          echo key.password="$SIGNING_KEY_PASSWORD" >> signing.properties
-            
-          echo "cat signing.properties"
-          cat signing.properties
+          if [ -n "$SIGNING_KEYSTORE_BASE64" ]; then
+            echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > release.keystore
+            {
+              echo "keystore.password=$SIGNING_STORE_PASSWORD"
+              echo "key.alias=$SIGNING_KEY_ALIAS"
+              echo "key.password=$SIGNING_KEY_PASSWORD"
+            } > signing.properties
+          fi
 
       - name: Release Build
         if: success()
