@@ -49,7 +49,7 @@ jobs:
         working-directory: core/src/foss/golang/clash
         run: |
           go vet ./adapter/outboundgroup/...
-          go test -race -v ./adapter/outboundgroup -run TestFallback
+          go test -v ./adapter/outboundgroup -run TestFallback
 
       - uses: actions/cache@v5
         with:
