@@ -1,8 +1,8 @@
 diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.go
-index 98aaf20..e6d1b65 100644
+index 98aaf20..0bca7a0 100644
 --- a/adapter/outboundgroup/fallback.go
 +++ b/adapter/outboundgroup/fallback.go
-@@ -4,15 +4,201 @@ import (
+@@ -4,15 +4,205 @@ import (
  	"context"
  	"encoding/json"
  	"errors"
@@ -35,6 +35,9 @@ index 98aaf20..e6d1b65 100644
 +	fallbackMaxCooldown        = 5 * time.Minute
 +	fallbackRecoveryStableTime = 5 * time.Minute
 +	fallbackCloseSampleDelay   = 2 * time.Second
++	fallbackStrongProbeGap     = 3 * time.Second
++	fallbackWeakProbeGap       = 15 * time.Second
++	fallbackPruneInterval      = 30 * time.Second
 +)
 +
 +type proxyFailState struct {
@@ -42,6 +45,7 @@ index 98aaf20..e6d1b65 100644
 +	cooldownUntil time.Time
 +	backoffLevel  int
 +	probing       bool
++	lastProbe     time.Time
 +}
 +
 +type fallbackObserverConn struct {
@@ -204,7 +208,7 @@ index 98aaf20..e6d1b65 100644
  type FallbackOption struct{}
  
  type Fallback struct {
-@@ -21,6 +207,369 @@ type Fallback struct {
+@@ -21,6 +211,391 @@ type Fallback struct {
  	testUrl        string
  	selected       string
  	expectedStatus string
@@ -217,6 +221,9 @@ index 98aaf20..e6d1b65 100644
 +	baseCooldown     time.Duration
 +	recoveryWindow   time.Duration
 +	closeSampleDelay time.Duration
++	strongProbeGap   time.Duration
++	weakProbeGap     time.Duration
++	lastPrune        time.Time
 +}
 +
 +func isSkippableAdapter(adapterType C.AdapterType) bool {
@@ -232,7 +239,7 @@ index 98aaf20..e6d1b65 100644
 +		return f.stallTimeout
 +	}
 +	if proxy != nil {
-+		if delay := proxy.LastDelayForTestUrl(f.testUrl); delay > 0 {
++		if delay := proxy.LastDelayForTestUrl(f.testUrl); delay > 0 && delay < 0xffff {
 +			d := 3*time.Duration(delay)*time.Millisecond + 2*time.Second
 +			if d < fallbackMinStallThreshold {
 +				return fallbackMinStallThreshold
@@ -251,7 +258,7 @@ index 98aaf20..e6d1b65 100644
 +		return f.staggerDelay
 +	}
 +	if proxy != nil {
-+		if delay := proxy.LastDelayForTestUrl(f.testUrl); delay > 0 {
++		if delay := proxy.LastDelayForTestUrl(f.testUrl); delay > 0 && delay < 0xffff {
 +			d := 2 * time.Duration(delay) * time.Millisecond
 +			if d < fallbackMinStaggerDelay {
 +				return fallbackMinStaggerDelay
@@ -265,11 +272,28 @@ index 98aaf20..e6d1b65 100644
 +	return fallbackMinStaggerDelay
 +}
 +
-+func (f *Fallback) effectiveProbeTimeout() time.Duration {
++func (f *Fallback) probeTimeoutForProxy(proxy C.Proxy) time.Duration {
 +	if f.probeTimeout > 0 {
 +		return f.probeTimeout
 +	}
-+	return fallbackProbeTimeout
++	t := f.stallTimeoutForProxy(proxy)
++	if t < fallbackProbeTimeout {
++		return fallbackProbeTimeout
++	}
++	return t
++}
++
++func (f *Fallback) effectiveProbeGap(strong bool) time.Duration {
++	if strong {
++		if f.strongProbeGap > 0 {
++			return f.strongProbeGap
++		}
++		return fallbackStrongProbeGap
++	}
++	if f.weakProbeGap > 0 {
++		return f.weakProbeGap
++	}
++	return fallbackWeakProbeGap
 +}
 +
 +func (f *Fallback) effectiveBaseCooldown() time.Duration {
@@ -483,8 +507,10 @@ index 98aaf20..e6d1b65 100644
 +		}
 +	}
 +
-+	if !shouldDemoteMultiHost && !st.probing {
++	minGap := f.effectiveProbeGap(strong)
++	if !shouldDemoteMultiHost && !st.probing && (st.lastProbe.IsZero() || now.Sub(st.lastProbe) >= minGap) {
 +		st.probing = true
++		st.lastProbe = now
 +		shouldProbe = true
 +	}
 +	f.stateMux.Unlock()
@@ -505,7 +531,7 @@ index 98aaf20..e6d1b65 100644
 +				f.stateMux.Unlock()
 +			}()
 +
-+			ctx, cancel := context.WithTimeout(context.Background(), f.effectiveProbeTimeout())
++			ctx, cancel := context.WithTimeout(context.Background(), f.probeTimeoutForProxy(proxy))
 +			defer cancel()
 +
 +			errSelf, errPeer := f.probePair(ctx, proxy, peer)
@@ -574,7 +600,7 @@ index 98aaf20..e6d1b65 100644
  }
  
  func (f *Fallback) Now() string {
-@@ -28,38 +577,176 @@ func (f *Fallback) Now() string {
+@@ -28,38 +603,176 @@ func (f *Fallback) Now() string {
  	return proxy.Name()
  }
  
@@ -770,7 +796,7 @@ index 98aaf20..e6d1b65 100644
  }
  
  // SupportUDP implements C.ProxyAdapter
-@@ -83,13 +770,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+@@ -83,13 +796,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
  	for _, proxy := range f.GetProxies(false) {
  		all = append(all, proxy.Name())
  	}
@@ -788,7 +814,7 @@ index 98aaf20..e6d1b65 100644
  		"hidden":         f.Hidden(),
  		"icon":           f.Icon(),
  		"emptyFallback":  f.EmptyFallback().Name(),
-@@ -102,25 +792,80 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
+@@ -102,25 +818,81 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
  	return proxy
  }
  
@@ -802,8 +828,9 @@ index 98aaf20..e6d1b65 100644
 +	now := time.Now()
 +
 +	f.stateMux.Lock()
-+	// Always prune states for proxies that were removed or replaced in providers.
-+	if len(f.proxyStates) > 0 {
++	// Periodically prune states for proxies that were removed or replaced in providers.
++	if len(f.proxyStates) > 0 && now.Sub(f.lastPrune) >= fallbackPruneInterval {
++		f.lastPrune = now
 +		active := make(map[string]struct{}, len(proxies))
 +		for _, p := range proxies {
 +			active[p.Name()] = struct{}{}
@@ -830,10 +857,11 @@ index 98aaf20..e6d1b65 100644
  					f.selected = ""
  				}
 +				break
-+			}
-+		}
-+	}
-+
+ 			}
+ 		}
+ 	}
+ 
+-	return proxies[0]
 +	aliveHealthy := make([]C.Proxy, 0, len(proxies))
 +	aliveDemoted := make([]C.Proxy, 0)
 +	otherHealthy := make([]C.Proxy, 0)
@@ -859,12 +887,11 @@ index 98aaf20..e6d1b65 100644
 +				otherHealthy = append(otherHealthy, proxy)
 +			} else {
 +				otherDemoted = append(otherDemoted, proxy)
- 			}
- 		}
- 	}
++			}
++		}
++	}
 +	f.stateMux.Unlock()
- 
--	return proxies[0]
++
 +	candidates := make([]C.Proxy, 0, len(proxies))
 +	candidates = append(candidates, aliveHealthy...)
 +	candidates = append(candidates, aliveDemoted...)
@@ -879,7 +906,7 @@ index 98aaf20..e6d1b65 100644
  }
  
  func (f *Fallback) Set(name string) error {
-@@ -136,7 +881,11 @@ func (f *Fallback) Set(name string) error {
+@@ -136,7 +908,11 @@ func (f *Fallback) Set(name string) error {
  		return errors.New("proxy not exist")
  	}
  
@@ -891,7 +918,7 @@ index 98aaf20..e6d1b65 100644
  	if !p.AliveForTestUrl(f.testUrl) {
  		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
  		defer cancel()
-@@ -148,7 +897,10 @@ func (f *Fallback) Set(name string) error {
+@@ -148,7 +924,10 @@ func (f *Fallback) Set(name string) error {
  }
  
  func (f *Fallback) ForceSet(name string) {
@@ -902,7 +929,7 @@ index 98aaf20..e6d1b65 100644
  }
  
  func (f *Fallback) Providers() []P.ProxyProvider {
-@@ -177,5 +929,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
+@@ -177,5 +956,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
  		disableUDP:     option.DisableUDP,
  		testUrl:        option.URL,
  		expectedStatus: option.ExpectedStatus,
@@ -911,10 +938,10 @@ index 98aaf20..e6d1b65 100644
  }
 diff --git a/adapter/outboundgroup/fallback_test.go b/adapter/outboundgroup/fallback_test.go
 new file mode 100644
-index 0000000..af206e2
+index 0000000..18bb7be
 --- /dev/null
 +++ b/adapter/outboundgroup/fallback_test.go
-@@ -0,0 +1,332 @@
+@@ -0,0 +1,366 @@
 +package outboundgroup
 +
 +import (
@@ -1038,6 +1065,8 @@ index 0000000..af206e2
 +	fb.baseCooldown = 200 * time.Millisecond
 +	fb.recoveryWindow = 200 * time.Millisecond
 +	fb.closeSampleDelay = 60 * time.Millisecond
++	fb.strongProbeGap = 10 * time.Millisecond
++	fb.weakProbeGap = 100 * time.Millisecond
 +	return fb
 +}
 +
@@ -1245,5 +1274,37 @@ index 0000000..af206e2
 +	}
 +	if got := fb.stallTimeoutForProxy(pHigh); got != 10*time.Second {
 +		t.Fatalf("high delay stall expected 10s cap, got %v", got)
++	}
++}
++
++func TestFallbackUnknownDelay0xFFFFUsesDefaults(t *testing.T) {
++	pUnknown := newMockProxy("unknown")
++	pUnknown.lastDelay.Store(0xffff)
++	fb, _ := NewFallback(GroupCommonOption{Name: "dyn-unknown"}, FallbackOption{}, pUnknown, []P.ProxyProvider{&mockProvider{proxies: []C.Proxy{pUnknown}}})
++
++	if got := fb.staggerDelayForProxy(pUnknown); got != 1500*time.Millisecond {
++		t.Fatalf("0xffff delay stagger expected 1.5s default, got %v", got)
++	}
++	if got := fb.stallTimeoutForProxy(pUnknown); got != 4*time.Second {
++		t.Fatalf("0xffff delay stall expected 4s default, got %v", got)
++	}
++	if got := fb.probeTimeoutForProxy(pUnknown); got != 4*time.Second {
++		t.Fatalf("0xffff delay probe timeout expected 4s, got %v", got)
++	}
++}
++
++func TestFallbackWeakProbeRateLimit(t *testing.T) {
++	primary := newMockProxy("cf-primary")
++	backup := newMockProxy("backup-1")
++	fb := newTestFallback(t, primary, backup)
++	fb.weakProbeGap = 200 * time.Millisecond
++
++	for i := 0; i < 5; i++ {
++		fb.reportSuspect(primary, "ad.example.com", false)
++		time.Sleep(15 * time.Millisecond)
++	}
++	time.Sleep(50 * time.Millisecond)
++	if got := primary.urlTests.Load(); got != 1 {
++		t.Fatalf("expected weak EOF burst to be rate-limited to 1 probe, got %d", got)
 +	}
 +}
