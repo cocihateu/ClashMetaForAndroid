@@ -1,8 +1,8 @@
 diff --git a/adapter/outboundgroup/fallback.go b/adapter/outboundgroup/fallback.go
-index 98aaf20..0bca7a0 100644
+index 98aaf20..25f57ae 100644
 --- a/adapter/outboundgroup/fallback.go
 +++ b/adapter/outboundgroup/fallback.go
-@@ -4,15 +4,205 @@ import (
+@@ -4,15 +4,215 @@ import (
  	"context"
  	"encoding/json"
  	"errors"
@@ -45,7 +45,17 @@ index 98aaf20..0bca7a0 100644
 +	cooldownUntil time.Time
 +	backoffLevel  int
 +	probing       bool
++	pendingProbe  bool
 +	lastProbe     time.Time
++	probeTimer    *time.Timer
++}
++
++func (st *proxyFailState) stopProbeTimerLocked() {
++	if st.probeTimer != nil {
++		st.probeTimer.Stop()
++		st.probeTimer = nil
++	}
++	st.pendingProbe = false
 +}
 +
 +type fallbackObserverConn struct {
@@ -208,7 +218,7 @@ index 98aaf20..0bca7a0 100644
  type FallbackOption struct{}
  
  type Fallback struct {
-@@ -21,6 +211,391 @@ type Fallback struct {
+@@ -21,6 +221,450 @@ type Fallback struct {
  	testUrl        string
  	selected       string
  	expectedStatus string
@@ -358,6 +368,7 @@ index 98aaf20..0bca7a0 100644
 +	}
 +	st.cooldownUntil = now.Add(cooldown)
 +	st.suspectHosts = nil
++	st.stopProbeTimerLocked()
 +	if f.selected == name {
 +		f.selected = ""
 +	}
@@ -507,11 +518,25 @@ index 98aaf20..0bca7a0 100644
 +		}
 +	}
 +
-+	minGap := f.effectiveProbeGap(strong)
-+	if !shouldDemoteMultiHost && !st.probing && (st.lastProbe.IsZero() || now.Sub(st.lastProbe) >= minGap) {
-+		st.probing = true
-+		st.lastProbe = now
-+		shouldProbe = true
++	if !shouldDemoteMultiHost {
++		minGap := f.effectiveProbeGap(strong)
++		switch {
++		case st.probing:
++			if strong {
++				st.pendingProbe = true
++			}
++		case st.lastProbe.IsZero() || now.Sub(st.lastProbe) >= minGap:
++			st.probing = true
++			st.lastProbe = now
++			st.stopProbeTimerLocked()
++			shouldProbe = true
++		case strong && st.probeTimer == nil:
++			wait := minGap - now.Sub(st.lastProbe)
++			p := proxy
++			st.probeTimer = time.AfterFunc(wait, func() {
++				f.runDeferredProbe(p)
++			})
++		}
 +	}
 +	f.stateMux.Unlock()
 +
@@ -521,26 +546,70 @@ index 98aaf20..0bca7a0 100644
 +	}
 +
 +	if shouldProbe {
-+		peer := f.findProbePeer(name)
-+		go func() {
-+			defer func() {
-+				f.stateMux.Lock()
-+				if st, ok := f.proxyStates[name]; ok {
-+					st.probing = false
-+				}
-+				f.stateMux.Unlock()
-+			}()
-+
-+			ctx, cancel := context.WithTimeout(context.Background(), f.probeTimeoutForProxy(proxy))
-+			defer cancel()
-+
-+			errSelf, errPeer := f.probePair(ctx, proxy, peer)
-+			// Only demote when self fails AND peer succeeds; if both fail, treat as local outage.
-+			if errSelf != nil && errPeer == nil {
-+				f.demoteProxy(proxy, "comparative URLTest failed while peer ok: "+errSelf.Error())
-+			}
-+		}()
++		f.startProbe(proxy)
 +	}
++}
++
++func (f *Fallback) runDeferredProbe(proxy C.Proxy) {
++	if proxy == nil {
++		return
++	}
++	name := proxy.Name()
++	now := time.Now()
++
++	f.stateMux.Lock()
++	st, ok := f.proxyStates[name]
++	if !ok {
++		f.stateMux.Unlock()
++		return
++	}
++	st.probeTimer = nil
++	if now.Before(st.cooldownUntil) {
++		st.pendingProbe = false
++		f.stateMux.Unlock()
++		return
++	}
++	if st.probing {
++		st.pendingProbe = true
++		f.stateMux.Unlock()
++		return
++	}
++	st.probing = true
++	st.pendingProbe = false
++	st.lastProbe = now
++	f.stateMux.Unlock()
++
++	f.startProbe(proxy)
++}
++
++func (f *Fallback) startProbe(proxy C.Proxy) {
++	name := proxy.Name()
++	peer := f.findProbePeer(name)
++	go func() {
++		defer func() {
++			f.stateMux.Lock()
++			if st, ok := f.proxyStates[name]; ok {
++				st.probing = false
++				if st.pendingProbe && st.probeTimer == nil && !time.Now().Before(st.cooldownUntil) {
++					st.pendingProbe = false
++					p := proxy
++					st.probeTimer = time.AfterFunc(f.effectiveProbeGap(true), func() {
++						f.runDeferredProbe(p)
++					})
++				}
++			}
++			f.stateMux.Unlock()
++		}()
++
++		ctx, cancel := context.WithTimeout(context.Background(), f.probeTimeoutForProxy(proxy))
++		defer cancel()
++
++		errSelf, errPeer := f.probePair(ctx, proxy, peer)
++		// Only demote when self fails AND peer succeeds; if both fail, treat as local outage.
++		if errSelf != nil && errPeer == nil {
++			f.demoteProxy(proxy, "comparative URLTest failed while peer ok: "+errSelf.Error())
++		}
++	}()
 +}
 +
 +func (f *Fallback) recordProxySuccess(proxy C.Proxy) {
@@ -600,7 +669,7 @@ index 98aaf20..0bca7a0 100644
  }
  
  func (f *Fallback) Now() string {
-@@ -28,38 +603,176 @@ func (f *Fallback) Now() string {
+@@ -28,38 +672,176 @@ func (f *Fallback) Now() string {
  	return proxy.Name()
  }
  
@@ -796,7 +865,7 @@ index 98aaf20..0bca7a0 100644
  }
  
  // SupportUDP implements C.ProxyAdapter
-@@ -83,13 +796,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
+@@ -83,13 +865,16 @@ func (f *Fallback) MarshalJSON() ([]byte, error) {
  	for _, proxy := range f.GetProxies(false) {
  		all = append(all, proxy.Name())
  	}
@@ -814,7 +883,7 @@ index 98aaf20..0bca7a0 100644
  		"hidden":         f.Hidden(),
  		"icon":           f.Icon(),
  		"emptyFallback":  f.EmptyFallback().Name(),
-@@ -102,25 +818,81 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
+@@ -102,25 +887,82 @@ func (f *Fallback) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
  	return proxy
  }
  
@@ -835,8 +904,9 @@ index 98aaf20..0bca7a0 100644
 +		for _, p := range proxies {
 +			active[p.Name()] = struct{}{}
 +		}
-+		for name := range f.proxyStates {
++		for name, st := range f.proxyStates {
 +			if _, ok := active[name]; !ok {
++				st.stopProbeTimerLocked()
 +				delete(f.proxyStates, name)
  			}
 -		} else {
@@ -906,30 +976,36 @@ index 98aaf20..0bca7a0 100644
  }
  
  func (f *Fallback) Set(name string) error {
-@@ -136,7 +908,11 @@ func (f *Fallback) Set(name string) error {
+@@ -136,7 +978,14 @@ func (f *Fallback) Set(name string) error {
  		return errors.New("proxy not exist")
  	}
  
 +	f.stateMux.Lock()
  	f.selected = name
-+	delete(f.proxyStates, name)
++	if st, ok := f.proxyStates[name]; ok {
++		st.stopProbeTimerLocked()
++		delete(f.proxyStates, name)
++	}
 +	f.stateMux.Unlock()
 +
  	if !p.AliveForTestUrl(f.testUrl) {
  		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(5000))
  		defer cancel()
-@@ -148,7 +924,10 @@ func (f *Fallback) Set(name string) error {
+@@ -148,7 +997,13 @@ func (f *Fallback) Set(name string) error {
  }
  
  func (f *Fallback) ForceSet(name string) {
 +	f.stateMux.Lock()
  	f.selected = name
-+	delete(f.proxyStates, name)
++	if st, ok := f.proxyStates[name]; ok {
++		st.stopProbeTimerLocked()
++		delete(f.proxyStates, name)
++	}
 +	f.stateMux.Unlock()
  }
  
  func (f *Fallback) Providers() []P.ProxyProvider {
-@@ -177,5 +956,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
+@@ -177,5 +1032,6 @@ func NewFallback(option GroupCommonOption, fallbackOption FallbackOption, emptyF
  		disableUDP:     option.DisableUDP,
  		testUrl:        option.URL,
  		expectedStatus: option.ExpectedStatus,
@@ -938,10 +1014,10 @@ index 98aaf20..0bca7a0 100644
  }
 diff --git a/adapter/outboundgroup/fallback_test.go b/adapter/outboundgroup/fallback_test.go
 new file mode 100644
-index 0000000..18bb7be
+index 0000000..f1a1370
 --- /dev/null
 +++ b/adapter/outboundgroup/fallback_test.go
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,390 @@
 +package outboundgroup
 +
 +import (
@@ -1306,5 +1382,29 @@ index 0000000..18bb7be
 +	time.Sleep(50 * time.Millisecond)
 +	if got := primary.urlTests.Load(); got != 1 {
 +		t.Fatalf("expected weak EOF burst to be rate-limited to 1 probe, got %d", got)
++	}
++}
++
++func TestFallbackRateLimitedStrongSignalIsCoalesced(t *testing.T) {
++	primary := newMockProxy("cf-primary")
++	backup := newMockProxy("backup-1")
++	fb := newTestFallback(t, primary, backup)
++	fb.strongProbeGap = 100 * time.Millisecond
++
++	// First strong signal triggers probe that passes
++	fb.reportSuspect(primary, "a.com", true)
++	time.Sleep(30 * time.Millisecond)
++
++	// Node begins stalling right after first probe; second strong signal arrives within strongProbeGap
++	probeErr := errors.New("stalled")
++	primary.urlTestErr.Store(&probeErr)
++	fb.reportSuspect(primary, "b.com", true)
++
++	deadline := time.Now().Add(1 * time.Second)
++	for time.Now().Before(deadline) && fb.Now() != "backup-1" {
++		time.Sleep(15 * time.Millisecond)
++	}
++	if primary.urlTests.Load() < 2 || fb.Now() != "backup-1" {
++		t.Fatalf("rate-limited strong signal was dropped: tests=%d now=%s", primary.urlTests.Load(), fb.Now())
 +	}
 +}

@@ -45,12 +45,6 @@ jobs:
           cd $(go env GOROOT)
           for p in $GITHUB_WORKSPACE/.github/patch/*.patch; do patch --verbose -p 1 < "$p"; done
 
-      - name: Verify Mihomo Fallback Patch
-        working-directory: core/src/foss/golang/clash
-        run: |
-          go vet ./adapter/outboundgroup/...
-          go test -v ./adapter/outboundgroup -run TestFallback
-
       - uses: actions/cache@v5
         with:
           path: |
@@ -59,6 +53,12 @@ jobs:
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
             ${{ runner.os }}-go-
+
+      - name: Verify Mihomo Fallback Patch
+        working-directory: core/src/foss/golang/clash
+        run: |
+          go vet ./adapter/outboundgroup/...
+          go test -v ./adapter/outboundgroup -run TestFallback
 
       - name: Update CA
         run: |
