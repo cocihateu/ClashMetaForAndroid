@@ -23,6 +23,7 @@ Feature of [Clash.Meta](https://github.com/MetaCubeX/Clash.Meta)
    ```bash
    git submodule update --init --recursive
    git -C core/src/foss/golang/clash apply --include=adapter/outboundgroup/fallback.go "$PWD/.github/mihomo-patch/enhance-fallback.patch"
+   git -C core/src/foss/golang/clash apply "$PWD/.github/mihomo-patch/fallback-udp.patch"
    ```
 
 2. Install **OpenJDK 21**, **Android SDK**, **CMake** and **Golang**
@@ -73,14 +74,13 @@ APP package name is `com.github.metacubex.clash.meta`
 
 #### Meta Kernel
 
-- CMFA uses the kernel from `android-real` branch under `MetaCubeX/Clash.Meta`, which is a merge of the main `Alpha` branch and `android-open`.
+- The core submodule tracks [`MetaCubeX/mihomo`'s `Alpha` branch](https://github.com/MetaCubeX/mihomo/tree/Alpha) for dependency updates. Android builds use the revision pinned by this checkout and apply the [fallback patches](.github/mihomo-patch/README.md) as shown in [Build](#build).
   - If you want to contribute to the kernel, make PRs to `Alpha` branch of the Meta kernel repository.
-  - If you want to contribute Android-specific patches to the kernel, make PRs to  `android-open` branch of the Meta kernel repository.
 
 #### Maintenance
 
-- When `MetaCubeX/Clash.Meta` kernel is updated to a new version, the `Update Dependencies` actions in this repo will be triggered automatically.
-  - It will pull the new version of the meta kernel, update all the golang dependencies, and create a PR without manual intervention.
+- The `Update Dependencies` workflow runs on a `core-updated` repository dispatch or a manual dispatch.
+  - It updates the core pin from `Alpha`, refreshes the Go dependencies, and opens a PR.
   - If there is any compile error in PR, you need to fix it before merging. Alternatively, you may merge the PR directly.
 - Manually triggering `Build Pre-Release` actions will compile and publish a `PreRelease` version.
 - Manually triggering `Build Release` actions will compile, tag and publish a `Release` version.
