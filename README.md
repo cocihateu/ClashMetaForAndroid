@@ -18,11 +18,11 @@ Feature of [Clash.Meta](https://github.com/MetaCubeX/Clash.Meta)
 
 ### Build
 
-1. Initialize the pinned core and apply the fallback policy, as in the Android build workflows.
+1. Initialize the pinned core and apply both patches in full, as in the Android build workflows: first the group policy and provider health-check completion callback, then destination-specific UDP routing.
 
    ```bash
    git submodule update --init --recursive
-   git -C core/src/foss/golang/clash apply --include=adapter/outboundgroup/fallback.go "$PWD/.github/mihomo-patch/enhance-fallback.patch"
+   git -C core/src/foss/golang/clash apply "$PWD/.github/mihomo-patch/enhance-fallback.patch"
    git -C core/src/foss/golang/clash apply "$PWD/.github/mihomo-patch/fallback-udp.patch"
    ```
 

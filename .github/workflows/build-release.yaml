@@ -23,8 +23,8 @@ jobs:
 
       - name: Apply Mihomo Fallback Enhancement
         run: |
-          git -C core/src/foss/golang/clash apply --check --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
-          git -C core/src/foss/golang/clash apply --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/src/foss/golang/clash apply --check "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/src/foss/golang/clash apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
           git -C core/src/foss/golang/clash apply "$GITHUB_WORKSPACE/.github/mihomo-patch/fallback-udp.patch"
 
       - name: Configure Custom Application ID
