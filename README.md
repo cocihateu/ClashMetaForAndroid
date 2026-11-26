@@ -18,13 +18,14 @@ Feature of [Clash.Meta](https://github.com/MetaCubeX/Clash.Meta)
 
 ### Build
 
-1. Update submodules
+1. Initialize the pinned core and apply the fallback policy, as in the Android build workflows.
 
    ```bash
    git submodule update --init --recursive
+   git -C core/src/foss/golang/clash apply --include=adapter/outboundgroup/fallback.go "$PWD/.github/mihomo-patch/enhance-fallback.patch"
    ```
 
-2. Install **OpenJDK 11**, **Android SDK**, **CMake** and **Golang**
+2. Install **OpenJDK 21**, **Android SDK**, **CMake** and **Golang**
 
 3. Create `local.properties` in project root with
 
