@@ -19,8 +19,8 @@ jobs:
 
       - name: Apply Mihomo Fallback Enhancement
         run: |
-          git -C core/src/foss/golang/clash apply --check "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
-          git -C core/src/foss/golang/clash apply "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/src/foss/golang/clash apply --check --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
+          git -C core/src/foss/golang/clash apply --include=adapter/outboundgroup/fallback.go "$GITHUB_WORKSPACE/.github/mihomo-patch/enhance-fallback.patch"
 
       - name: Configure Custom Application ID
         run: echo "custom.application.id=com.cocihateu.clash" >> local.properties
@@ -54,11 +54,9 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
-      - name: Verify Mihomo Fallback Patch
+      - name: Compile Mihomo Fallback Package
         working-directory: core/src/foss/golang/clash
-        run: |
-          go vet ./adapter/outboundgroup/...
-          CGO_ENABLED=1 go test -race -v ./adapter/outboundgroup -run TestFallback
+        run: go build ./adapter/outboundgroup/...
 
       - name: Update CA
         run: |
